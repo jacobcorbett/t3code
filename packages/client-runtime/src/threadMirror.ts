@@ -46,7 +46,6 @@ export function threadMirrorHostChoices(input: {
 export function threadMirrorNotice(sourceLabel: string) {
   return {
     title: `${sourceLabel} is offline`,
-    detail:
-      "Showing the list it last shared. Status may be out of date, and you can't start or change threads on it until it is back.",
+    detail: "Showing saved threads. Reconnect to make changes.",
   } as const;
 }
