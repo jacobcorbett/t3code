@@ -79,6 +79,10 @@
       "types": "./src/linkRequest.ts",
       "default": "./src/linkRequest.ts"
     },
+    "./thread-mirror": {
+      "types": "./src/threadMirror.ts",
+      "default": "./src/threadMirror.ts"
+    },
     "./scheduled-task-webhook": {
       "types": "./src/scheduledTaskWebhook.ts",
       "default": "./src/scheduledTaskWebhook.ts"

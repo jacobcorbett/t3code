@@ -1,4 +1,5 @@
 import {
+  createEnvironmentMirrorSummaryAtom,
   createEnvironmentShellAtoms,
   createEnvironmentShellSummaryAtom,
   createEnvironmentSnapshotAtom,
@@ -16,6 +17,11 @@ import { connectionAtomRuntime } from "../connection/runtime";
 export const environmentShell = createEnvironmentShellAtoms(connectionAtomRuntime);
 export const environmentSnapshotAtom = createEnvironmentSnapshotAtom(environmentShell.stateAtom);
 export const environmentShellSummaryAtom = createEnvironmentShellSummaryAtom({
+  catalogValueAtom: environmentCatalog.catalogValueAtom,
+  shellStateValueAtom: environmentShell.stateValueAtom,
+});
+
+export const environmentMirrorSummaryAtom = createEnvironmentMirrorSummaryAtom({
   catalogValueAtom: environmentCatalog.catalogValueAtom,
   shellStateValueAtom: environmentShell.stateValueAtom,
 });

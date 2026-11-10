@@ -1,5 +1,5 @@
 import { Connection } from "@t3tools/client-runtime/connection";
-import { ShellSnapshotLoader } from "@t3tools/client-runtime/state/shell";
+import { ShellSnapshotLoader, ThreadMirrorLoader } from "@t3tools/client-runtime/state/shell";
 import {
   BoundedThreadSnapshotLoader,
   ThreadHistoryController,
@@ -20,6 +20,7 @@ const layerProvidedConnectionPlatform = ConnectionPlatform.layer.pipe(Layer.prov
 const layerSnapshotLoader = Layer.mergeAll(
   BoundedThreadSnapshotLoader.layer,
   ShellSnapshotLoader.layer,
+  ThreadMirrorLoader.layer,
   ThreadHistoryController.layer,
   PullRequestDiffLoader.layer,
 );

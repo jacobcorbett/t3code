@@ -3,6 +3,7 @@ import {
   connectionProjectionPhase,
 } from "@t3tools/client-runtime/connection";
 import {
+  createEnvironmentMirrorSummaryAtom,
   createEnvironmentShellAtoms,
   createEnvironmentSnapshotAtom,
   createShellEnvironmentAtoms,
@@ -26,6 +27,10 @@ import { isLocalEnvironmentDisabled } from "../localEnvironment";
 export const shellEnvironment = createShellEnvironmentAtoms(connectionAtomRuntime);
 export const environmentShell = createEnvironmentShellAtoms(connectionAtomRuntime);
 export const environmentSnapshotAtom = createEnvironmentSnapshotAtom(environmentShell.stateAtom);
+export const environmentMirrorSummaryAtom = createEnvironmentMirrorSummaryAtom({
+  catalogValueAtom: environmentCatalog.catalogValueAtom,
+  shellStateValueAtom: environmentShell.stateValueAtom,
+});
 
 const NO_SHELL_STATUS_ATOM = Atom.make<EnvironmentShellStatus | null>(null).pipe(
   Atom.withLabel("web-environment-shell-status:none"),

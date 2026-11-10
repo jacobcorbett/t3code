@@ -3,6 +3,7 @@ import {
   AuthSessionId,
   EnvironmentAuthenticatedAuth,
   EnvironmentAuthenticatedPrincipal,
+  EnvironmentPeerLinkAuth,
   EnvironmentHttpApi,
   EnvironmentVoiceBodyLimit,
   type AuthBrowserSessionRequest,
@@ -120,6 +121,7 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
         ),
       ]),
       Effect.provideService(EnvironmentAuthenticatedAuth, authenticatedAuth),
+      Effect.provideService(EnvironmentPeerLinkAuth, () => unexpectedEndpoint("peer link")),
       Effect.scoped,
     ),
   );

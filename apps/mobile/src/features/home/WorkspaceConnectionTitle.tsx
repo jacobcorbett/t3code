@@ -6,6 +6,8 @@ import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text } from "../../components/ui/AppText";
 import { useAndroidControlSizing } from "../../components/ui/useAndroidControlSizing";
 import { useDeadlinePassed } from "../../lib/clock";
+import { useAtomValue } from "@effect/atom-react";
+import { environmentMirrorSummaryAtom } from "../../state/shell";
 import { useWorkspaceState } from "../../state/workspace";
 import {
   workspaceConnectionStatusPresentation,
@@ -30,7 +32,20 @@ const ConnectionStatusContext = createContext<ConnectionStatus | null>(null);
  */
 export function WorkspaceConnectionStatusProvider(props: { readonly children: ReactNode }) {
   const { state } = useWorkspaceState();
-  const presentation = workspaceConnectionStatusPresentation(state);
+  const mirrored = useAtomValue(environmentMirrorSummaryAtom);
+  const workspacePresentation = workspaceConnectionStatusPresentation(state);
+  // A saved list is shown instead of a bare "Not connected", so it never reads as live.
+  const presentation: WorkspaceConnectionStatusPresentation | null =
+    mirrored.length > 0 &&
+    (workspacePresentation === null || workspacePresentation.label === "Not connected")
+      ? {
+          label:
+            mirrored.length === 1
+              ? `${mirrored[0]!.sourceLabel} is offline`
+              : `${mirrored.length} environments offline`,
+          showsProgress: false,
+        }
+      : workspacePresentation;
   const hasStatus = presentation !== null;
   // When the current status run began; a gap in the status restarts the delay.
   const [statusSince, setStatusSince] = useState(() => (hasStatus ? Date.now() : null));

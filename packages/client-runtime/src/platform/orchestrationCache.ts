@@ -24,6 +24,28 @@ export const ShellCacheOrigin = Schema.Struct({
   omitOlderSettled: Schema.Boolean,
   /** Epoch milliseconds of that snapshot; replay does not renew it. */
   snapshotAt: Schema.Number,
+  /** The server's database when the rows were taken; a replaced one never resumes from them. */
+  databaseId: Schema.optionalKey(Schema.String),
+  /**
+   * Where a copy of the rows is kept while the server is off, and this client's key to it, as the
+   * server issued them with these rows.
+   */
+  mirror: Schema.optionalKey(
+    Schema.Struct({ hostEnvironmentId: EnvironmentId, grant: Schema.String }),
+  ),
+  /**
+   * The rows came from the host's copy, so no cursor of theirs can resume a live stream. Kept with
+   * them so a restart still says where they came from and drops them once the host's lease ends.
+   */
+  fromMirror: Schema.optionalKey(
+    Schema.Struct({
+      sourceLabel: Schema.String,
+      /** Epoch milliseconds when the host last heard from the source. */
+      syncedAt: Schema.Number,
+      /** Epoch milliseconds when the host stops serving this copy. */
+      expiresAt: Schema.Number,
+    }),
+  ),
 });
 export type ShellCacheOrigin = typeof ShellCacheOrigin.Type;
 

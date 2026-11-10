@@ -83,6 +83,17 @@ Unlinking on the linking side only forgets the token.
   and can still be cancelled. Off on the receiving side, link registrations are
   refused and link sessions get a 403, which the linking side reports as
   retryable so the task's follower waits rather than failing it.
+- **Thread list copies are the one HTTP surface a link session may call.**
+  `PUT`/`DELETE /api/thread-mirror/:id` take only pairing-code link sessions
+  (`EnvironmentPeerLinkAuth`); `/mcp` tokens stay rejected everywhere else. The
+  host cannot verify that the id in the path is the writer's own environment, so
+  ownership is trust on first use: the first write for an id stores the hash of a
+  random writer secret the source keeps in its secret store, and only that secret
+  writes or deletes the copy until it expires. The secret outlives re-links and
+  restarts; a source that loses it waits out the expiry (at most 7 days). A link
+  holder that writes an id before its owner does can squat or poison that copy
+  but never read one, since readers need grants only the source can sign. The
+  host sees a grant in plain text whenever a client reads with it.
 - **A tool runs in a linked environment when its parameters take
   `OrchestratorMcpEnvironmentTarget`** as `environmentId`.
   [`McpToolAccess.toLayer`](../../apps/server/src/mcp/McpToolAccess.ts) sends

@@ -2,10 +2,18 @@ import { useAtomValue } from "@effect/atom-react";
 import { linkRequestFailureMessage } from "@t3tools/client-runtime/link-request";
 import {
   AuthAccessWriteScope,
+  AuthSettingsWriteScope,
   type AuthMcpClientAccess,
   type EnvironmentId,
+  isManagedSettingPath,
   type PeerLinkSummary,
 } from "@t3tools/contracts";
+import {
+  THREAD_MIRROR_NEEDS_LINKS,
+  THREAD_MIRROR_SETTING_DESCRIPTION,
+  THREAD_MIRROR_SETTING_TITLE,
+  threadMirrorHostChoices,
+} from "@t3tools/client-runtime/thread-mirror";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -19,7 +27,9 @@ import { useId, useRef, useState } from "react";
 
 import { requestConfirmDialog } from "~/confirmDialog";
 import { mintPairingCodeOn } from "~/state/peerPairingCode";
+import { useEnvironment } from "~/state/environments";
 import { peerLinkEnvironment, useLinkableMachines } from "~/state/peerLinks";
+import { serverEnvironment } from "~/state/server";
 import { useEnvironmentQuery } from "~/state/query";
 import { useEnvironmentScope, usePreparedConnection } from "~/state/session";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -38,6 +48,7 @@ import {
   DialogTrigger,
 } from "../ui/dialog";
 import { Input } from "../ui/input";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { ITEM_ROW_CLASSNAME, ITEM_ROW_INNER_CLASSNAME } from "./itemRows";
 import { LinkAccessPicker } from "./LinkAccessPicker";
@@ -85,7 +96,112 @@ export function LinkedEnvironmentsSettings({
           />
         ))
       )}
+      {links.data ? (
+        <ThreadMirrorRow environmentId={environmentId} links={links.data.links} />
+      ) : null}
     </SettingsSection>
+  );
+}
+
+const MIRROR_OFF = "off";
+
+function ThreadMirrorRow({
+  environmentId,
+  links,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly links: ReadonlyArray<PeerLinkSummary>;
+}) {
+  const environment = useEnvironment(environmentId);
+  const updateSettings = useAtomCommand(serverEnvironment.updateSettings, {
+    label: "thread list copy",
+    reportFailure: true,
+  });
+  const canWrite = useEnvironmentScope(environmentId, AuthSettingsWriteScope);
+  const settings = environment?.serverConfig?.settings;
+  // Older servers don't know the setting, so there is nothing to choose.
+  if (
+    settings === undefined ||
+    environment?.serverConfig?.environment.capabilities.threadMirror !== true
+  )
+    return null;
+  const selectedId = settings.threadMirrorHostEnvironmentId;
+  const managed = isManagedSettingPath(
+    environment.serverConfig?.managedPolicy,
+    "threadMirrorHostEnvironmentId",
+  );
+  const { options, selectedMissing } = threadMirrorHostChoices({ selectedId, links });
+  const selected = options.find((option) => option.environmentId === selectedId);
+  const linksOff = !settings.linkedEnvironmentsEnabled;
+  const choose = (value: string) =>
+    void updateSettings({
+      environmentId,
+      input: {
+        patch: {
+          threadMirrorHostEnvironmentId: value === MIRROR_OFF ? null : (value as EnvironmentId),
+        },
+      },
+    });
+  const note = selectedMissing
+    ? "The machine you chose is no longer linked. Turn this off, or choose another machine."
+    : selected?.problem
+      ? `${selected.label}: ${selected.problem}. The copy updates when it answers again.`
+      : linksOff && selectedId === null
+        ? THREAD_MIRROR_NEEDS_LINKS
+        : null;
+  return (
+    <SettingsRow
+      title={THREAD_MIRROR_SETTING_TITLE}
+      description={
+        <>
+          {THREAD_MIRROR_SETTING_DESCRIPTION}
+          {note === null ? null : (
+            <span className="mt-1 block text-warning-foreground">{note}</span>
+          )}
+        </>
+      }
+      control={
+        <Select
+          value={selectedId ?? MIRROR_OFF}
+          disabled={!canWrite || managed}
+          onValueChange={(next) => {
+            if (next !== null) choose(next as string);
+          }}
+        >
+          <SelectTrigger aria-label={THREAD_MIRROR_SETTING_TITLE}>
+            <SelectValue>
+              {(value: string | null) =>
+                value === null || value === MIRROR_OFF
+                  ? "Off"
+                  : (options.find((option) => option.environmentId === value)?.label ??
+                    "Unavailable machine")
+              }
+            </SelectValue>
+          </SelectTrigger>
+          <SelectPopup alignItemWithTrigger={false}>
+            <SelectItem value={MIRROR_OFF} hideIndicator>
+              Off
+            </SelectItem>
+            {options.map((option) => (
+              <SelectItem
+                key={option.environmentId}
+                value={option.environmentId}
+                disabled={linksOff || option.problem === "Link expired"}
+                hideIndicator
+              >
+                {option.label}
+                {option.problem === null ? "" : ` · ${option.problem}`}
+              </SelectItem>
+            ))}
+            {selectedMissing && selectedId !== null ? (
+              <SelectItem value={selectedId} disabled hideIndicator>
+                Unavailable machine
+              </SelectItem>
+            ) : null}
+          </SelectPopup>
+        </Select>
+      }
+    />
   );
 }
 

@@ -20,7 +20,7 @@ import { readAgentActivityPublishingActive } from "../cloud/config.ts";
 import { resolveServerSelfUpdateCapability } from "../cloud/selfUpdate.ts";
 import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
-import { databaseMigrationHead } from "../persistence/databaseMigrationHead.ts";
+import { databaseMigrationHead, recordedDatabaseId } from "../persistence/databaseMigrationHead.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import { isSpeechPlatformSupported } from "../speech/platform.ts";
 import { resolveServerEnvironmentLabel } from "./ServerEnvironmentLabel.ts";
@@ -290,8 +290,11 @@ export const make = Effect.gen(function* () {
       linkFence: true,
       mcpApprovalCodes: true,
       mcpHostedApproval: true,
+      threadMirror: true,
     },
   };
+  // Created by a migration, so absent until startup has run them; read once it is there.
+  let databaseId: string | undefined;
 
   return ServerEnvironment.of({
     getEnvironmentId: Effect.succeed(environmentId),
@@ -299,6 +302,9 @@ export const make = Effect.gen(function* () {
     getDescriptor: readAgentActivityPublishingActive(secrets).pipe(
       Effect.map((agentActivityPublishing) => ({
         ...descriptor,
+        ...((databaseId ??= recordedDatabaseId(serverConfig.dbPath)) === undefined
+          ? {}
+          : { databaseId }),
         capabilities: { ...descriptor.capabilities, agentActivityPublishing },
       })),
     ),

@@ -3,10 +3,12 @@ import {
   ORCHESTRATION_V2_WS_METHODS,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ShellStreamItem,
+  type ThreadMirrorCopy,
   ThreadId,
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -21,16 +23,37 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   AVAILABLE_CONNECTION_STATE,
+  ConnectionBlockedError,
+  ConnectionTransientError,
   PrimaryConnectionTarget,
   type PreparedConnection,
+  type SupervisorConnectionState,
 } from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
-import { type EnvironmentShellState, makeEnvironmentShellState } from "./shell.ts";
+import {
+  type EnvironmentShellState,
+  makeEnvironmentShellState,
+  mirrorFallbackEligible,
+} from "./shell.ts";
 import * as ShellSnapshotLoader from "./shellSnapshotHttp.ts";
+import * as ThreadMirrorLoader from "./threadMirrorHttp.ts";
 import { v2Project, v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
+
+function pendingSession(): SupervisorConnectionState {
+  return {
+    desired: true,
+    network: "online",
+    phase: "backoff",
+    stage: null,
+    attempt: 1,
+    generation: 1,
+    lastFailure: new ConnectionTransientError({ reason: "session-pending", detail: "Pending." }),
+    retryAt: 1,
+  };
+}
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -53,14 +76,17 @@ const LIVE_SHELL_SNAPSHOT: OrchestrationV2ShellSnapshot = {
   snapshotSequence: 1,
 };
 
-function session(client: WsRpcProtocolClient): RpcSession.RpcSession {
+function session(
+  client: WsRpcProtocolClient,
+  configEvents: ReturnType<RpcSession.RpcSession["subscribeServerConfig"]> = Stream.empty,
+): RpcSession.RpcSession {
   return {
     client,
     initialConfig: Effect.succeed({
       shellResumeCompletionMarker: true,
       environment: { serverVersion: "1.0.0" },
     } as never),
-    subscribeServerConfig: (input = {}) => client.subscribeServerConfig(input),
+    subscribeServerConfig: () => configEvents,
     ready: Effect.void,
     probe: Effect.void,
     inboundFrames: Effect.succeed(0),
@@ -1254,6 +1280,19 @@ describe("environment shell cold start", () => {
       resumes: false,
     },
     {
+      label: "rows that came from the host's copy",
+      origin: {
+        ...RECENT_ORIGIN,
+        fromMirror: { sourceLabel: "Mac", syncedAt: NOW, expiresAt: NOW + HOUR },
+      },
+      resumes: false,
+    },
+    {
+      label: "another source database",
+      origin: { ...RECENT_ORIGIN, databaseId: "replaced-database" },
+      resumes: false,
+    },
+    {
       label: "a 12 hour old origin",
       origin: { ...RECENT_ORIGIN, snapshotAt: NOW - 12 * HOUR },
       resumes: false,
@@ -1313,5 +1352,306 @@ describe("environment shell cold start", () => {
       yield* Queue.offer(warmReload.events, { kind: "synchronized" });
       yield* h.liveAt(HTTP_SEQUENCE + 1);
     }),
+  );
+});
+
+describe("environment shell thread list copy", () => {
+  const HOST = EnvironmentId.make("host-environment");
+  const CACHED_SEQUENCE = 5;
+  const settledAt = DateTime.makeUnsafe("2026-06-20T10:00:00.000Z");
+  const snoozedUntil = DateTime.makeUnsafe("2026-06-21T09:00:00.000Z");
+  const ORIGIN: Persistence.ShellCacheOrigin = {
+    serverVersion: "1.0.0",
+    databaseMigration: null,
+    omitIdleSubagents: false,
+    omitOlderSettled: false,
+    snapshotAt: 0,
+    databaseId: "db-1",
+    mirror: { hostEnvironmentId: HOST, grant: "phone-grant" },
+  };
+  const copyOf = (
+    sequence: number,
+    overrides: Partial<ThreadMirrorCopy> = {},
+  ): ThreadMirrorCopy => ({
+    sourceEnvironmentId: TARGET.environmentId,
+    sourceDatabaseId: "db-1",
+    sourceSequence: sequence,
+    sourceLabel: "Mac",
+    snapshot: {
+      ...v2ShellSnapshot,
+      snapshotSequence: sequence,
+      threads: [
+        { ...v2ThreadShell, settledOverride: "settled", settledAt },
+        { ...v2ThreadShell, id: ThreadId.make("snoozed"), snoozedUntil },
+      ],
+    },
+    receivedAt: DateTime.makeUnsafe("2026-06-20T10:00:05.000Z"),
+    expiresAt: DateTime.makeUnsafe("2026-06-27T10:00:00.000Z"),
+    ...overrides,
+  });
+
+  const UNREACHABLE: SupervisorConnectionState = {
+    desired: true,
+    network: "online",
+    phase: "backoff",
+    stage: null,
+    attempt: 1,
+    generation: 1,
+    lastFailure: new ConnectionTransientError({ reason: "network", detail: "Unreachable." }),
+    retryAt: 1,
+  };
+
+  const makeUnreachableSource = Effect.fn("test.makeUnreachableSourceShell")(function* (
+    copies: ReadonlyArray<ThreadMirrorCopy>,
+    origin: Persistence.ShellCacheOrigin = ORIGIN,
+    connection: SupervisorConnectionState = UNREACHABLE,
+  ) {
+    const events = yield* Queue.unbounded<OrchestrationV2ShellStreamItem>();
+    const loads = yield* Queue.unbounded<{
+      readonly grant: string;
+      readonly host: EnvironmentId;
+    }>();
+    const client = {
+      [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: () => Stream.fromQueue(events),
+    } as unknown as WsRpcProtocolClient;
+    const supervisorState = yield* SubscriptionRef.make(connection);
+    const activeSession = yield* SubscriptionRef.make<Option.Option<RpcSession.RpcSession>>(
+      Option.none(),
+    );
+    const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+      target: TARGET,
+      state: supervisorState,
+      session: activeSession,
+      prepared: yield* SubscriptionRef.make(Option.some(PREPARED)),
+      connect: Effect.void,
+      disconnect: Effect.void,
+      retryNow: Effect.void,
+    } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+    const cache = Persistence.EnvironmentCacheStore.of({
+      loadShell: () =>
+        Effect.succeedSome({ ...v2ShellSnapshot, snapshotSequence: CACHED_SEQUENCE, origin }),
+      saveShell: () => Effect.void,
+      loadThread: () => Effect.succeedNone,
+      saveThread: () => Effect.void,
+      removeThread: () => Effect.void,
+      loadServerConfig: () => Effect.succeedNone,
+      saveServerConfig: () => Effect.void,
+      loadVcsRefs: () => Effect.succeedNone,
+      saveVcsRefs: () => Effect.void,
+      removeVcsRefs: () => Effect.void,
+      clearVcsRefs: () => Effect.void,
+      clear: () => Effect.void,
+    });
+    const remaining = yield* Ref.make(copies);
+    const mirrorLoader = ThreadMirrorLoader.ThreadMirrorLoader.of({
+      readerGrant: Effect.succeedNone,
+      loadCopy: ({ hostEnvironmentId, grant }) =>
+        Queue.offer(loads, { grant, host: hostEnvironmentId }).pipe(
+          Effect.andThen(Ref.get(remaining)),
+          Effect.map((all) => Option.fromNullishOr(all[0])),
+          Effect.tap(() => Ref.update(remaining, (all) => (all.length > 1 ? all.slice(1) : all))),
+        ),
+    });
+    const state = yield* makeEnvironmentShellState().pipe(
+      Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+      Effect.provideService(Persistence.EnvironmentCacheStore, cache),
+      Effect.provideService(ShellSnapshotLoader.ShellSnapshotLoader, {
+        load: () => Effect.succeedNone,
+      }),
+      Effect.provideService(ThreadMirrorLoader.ThreadMirrorLoader, mirrorLoader),
+    );
+    // The host answers each attempt in order; waiting on the second guarantees the first one
+    // has been applied or refused.
+    const settleAttempts = Effect.fn("test.settleMirrorAttempts")(function* (count: number) {
+      for (let attempt = 0; attempt < count; attempt += 1) {
+        if (attempt > 0) yield* TestClock.adjust("45 seconds");
+        yield* Queue.take(loads);
+      }
+      yield* TestClock.adjust("45 seconds");
+      yield* Queue.take(loads);
+    });
+    return { state, events, loads, supervisorState, activeSession, client, settleAttempts };
+  });
+
+  it.effect(
+    "shows the host's newer copy while the source is unreachable, and live rows replace it",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* makeUnreachableSource([copyOf(9)]);
+
+          // The phone's cached list is stale (sequence 5); the host holds the source's settle and snooze.
+          const shown = yield* SubscriptionRef.changes(h.state).pipe(
+            Stream.filter((value) => Option.isSome(value.mirror)),
+            Stream.runHead,
+            Effect.map(Option.getOrThrow),
+          );
+          const rows = Option.getOrThrow(shown.snapshot);
+          expect(rows.snapshotSequence).toBe(9);
+          expect(rows.threads.map((thread) => thread.settledOverride)).toEqual(["settled", null]);
+          expect(rows.threads[1]?.snoozedUntil).toEqual(snoozedUntil);
+          expect(shown.status).toBe("cached");
+          expect(Option.getOrThrow(shown.mirror)).toEqual({
+            hostEnvironmentId: HOST,
+            sourceLabel: "Mac",
+            syncedAt: DateTime.toEpochMillis(DateTime.makeUnsafe("2026-06-20T10:00:05.000Z")),
+            expiresAt: DateTime.toEpochMillis(DateTime.makeUnsafe("2026-06-27T10:00:00.000Z")),
+          });
+
+          // The source comes back: its live list wins and the copy label goes away.
+          yield* SubscriptionRef.set(h.activeSession, Option.some(session(h.client)));
+          yield* SubscriptionRef.set(h.supervisorState, {
+            desired: true,
+            network: "online",
+            phase: "connected",
+            stage: null,
+            attempt: 1,
+            generation: 1,
+            lastFailure: null,
+            retryAt: null,
+          });
+          const liveThread = { ...v2ThreadShell, id: ThreadId.make("live-only"), title: "Live" };
+          yield* Queue.offer(h.events, {
+            kind: "snapshot",
+            snapshot: { ...v2ShellSnapshot, snapshotSequence: 3, threads: [liveThread] },
+          });
+          yield* Queue.offer(h.events, { kind: "synchronized" });
+          const live = yield* SubscriptionRef.changes(h.state).pipe(
+            Stream.filter((value) => value.status === "live"),
+            Stream.runHead,
+            Effect.map(Option.getOrThrow),
+          );
+          expect(Option.isNone(live.mirror)).toBe(true);
+          expect(Option.getOrThrow(live.snapshot).threads).toEqual([liveThread]);
+        }),
+      ),
+  );
+
+  it.effect.each([
+    { label: "an older copy", copy: copyOf(4) },
+    { label: "a copy of another database", copy: copyOf(99, { sourceDatabaseId: "db-2" }) },
+  ])("keeps the cached list for $label", ({ copy }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeUnreachableSource([copy]);
+        yield* h.settleAttempts(1);
+        const current = yield* SubscriptionRef.get(h.state);
+        expect(Option.getOrThrow(current.snapshot).snapshotSequence).toBe(CACHED_SEQUENCE);
+        expect(Option.isNone(current.mirror)).toBe(true);
+      }),
+    ),
+  );
+
+  it.effect("does not read a copy for a cache whose database it cannot compare", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { databaseId: _unknown, ...beforeDatabasesWereNamed } = ORIGIN;
+        const h = yield* makeUnreachableSource([copyOf(99)], beforeDatabasesWereNamed);
+        yield* h.settleAttempts(1);
+        const current = yield* SubscriptionRef.get(h.state);
+        expect(Option.getOrThrow(current.snapshot).snapshotSequence).toBe(CACHED_SEQUENCE);
+        expect(Option.isNone(current.mirror)).toBe(true);
+      }),
+    ),
+  );
+
+  it.effect("takes a later copy once the host has one the cache lacks", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeUnreachableSource([copyOf(4), copyOf(12)]);
+        yield* h.settleAttempts(2);
+        const current = yield* SubscriptionRef.get(h.state);
+        expect(Option.getOrThrow(current.snapshot).snapshotSequence).toBe(12);
+        expect(Option.isSome(current.mirror)).toBe(true);
+      }),
+    ),
+  );
+
+  it.effect("an equal copy keeps the rows and says the source is offline", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeUnreachableSource([copyOf(CACHED_SEQUENCE)]);
+        yield* h.settleAttempts(1);
+        const current = yield* SubscriptionRef.get(h.state);
+        expect(Option.getOrThrow(current.snapshot).snapshotSequence).toBe(CACHED_SEQUENCE);
+        expect(Option.getOrThrow(current.mirror)).toMatchObject({ sourceLabel: "Mac" });
+      }),
+    ),
+  );
+
+  it.effect.each([
+    { label: "refused credentials", reason: "authentication" as const },
+    { label: "an unsupported server", reason: "unsupported" as const },
+    { label: "a refused permission", reason: "permission" as const },
+  ])("does not read the host for $label", ({ reason }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeUnreachableSource([copyOf(9)], ORIGIN, {
+          ...UNREACHABLE,
+          phase: "blocked",
+          lastFailure: new ConnectionBlockedError({ reason, detail: "Refused." }),
+        });
+        yield* TestClock.adjust("10 minutes");
+        expect(yield* Queue.poll(h.loads)).toEqual(Option.none());
+        expect(Option.isNone((yield* SubscriptionRef.get(h.state)).mirror)).toBe(true);
+      }),
+    ),
+  );
+
+  it.effect.each([
+    { label: "a disabled connection", state: { ...UNREACHABLE, desired: false }, eligible: false },
+    { label: "a pending session", state: pendingSession(), eligible: false },
+    { label: "an unreachable source", state: UNREACHABLE, eligible: true },
+  ])("fallback eligibility for $label", ({ state, eligible }) =>
+    Effect.sync(() => expect(mirrorFallbackEligible(state)).toBe(eligible)),
+  );
+
+  it.effect("restores the copy notice from the cache and drops the rows when the lease ends", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fromMirror = { sourceLabel: "Mac", syncedAt: 1_000, expiresAt: 86_400_000 };
+        const restored = yield* makeUnreachableSource(
+          [],
+          { ...ORIGIN, fromMirror },
+          {
+            ...UNREACHABLE,
+            desired: false,
+          },
+        );
+        expect(Option.getOrThrow((yield* SubscriptionRef.get(restored.state)).mirror)).toEqual({
+          hostEnvironmentId: HOST,
+          ...fromMirror,
+        });
+
+        // The host's lease on those rows ended while the app was closed.
+        const lapsed = yield* makeUnreachableSource(
+          [],
+          { ...ORIGIN, fromMirror: { ...fromMirror, expiresAt: 0 } },
+          { ...UNREACHABLE, desired: false },
+        );
+        const current = yield* SubscriptionRef.get(lapsed.state);
+        expect(Option.isNone(current.snapshot)).toBe(true);
+        expect(Option.isNone(current.mirror)).toBe(true);
+      }),
+    ),
+  );
+
+  it.effect("drops a shown copy once its lease has ended", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeUnreachableSource([
+          copyOf(9, { expiresAt: DateTime.makeUnsafe(60_000) }),
+        ]);
+        yield* h.settleAttempts(1);
+        expect(Option.isSome((yield* SubscriptionRef.get(h.state)).mirror)).toBe(true);
+        yield* TestClock.adjust("2 minutes");
+        const current = yield* SubscriptionRef.changes(h.state).pipe(
+          Stream.filter((value) => Option.isNone(value.snapshot)),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow),
+        );
+        expect(Option.isNone(current.mirror)).toBe(true);
+      }),
+    ),
   );
 });
