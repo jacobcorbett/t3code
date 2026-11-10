@@ -361,6 +361,34 @@ ends, as for any delegated task. It keeps following the task across restarts.
 If the other machine revokes the link, or the link is removed here, the task
 fails with that reason.
 
+### See threads while a machine is off
+
+A machine can keep a read-only copy of its thread list on one linked machine, so
+your signed-in phone or browser still shows its threads while it is off. In
+**Settings → Environments → Linked environments**, choose the machine under
+**Keep a copy of this thread list on another machine**; on mobile it is under
+**Settings → Connections**. Choose **Off** to stop. It needs Linked environments
+on for both machines.
+
+- The copy holds thread titles, status, times, project folders, branches and
+  pull request links, which the linked machine can read. Messages, error text,
+  goals, background task details and archived threads stay on the original
+  machine. The saved list shows nothing live: it says the machine is offline and
+  when it last synced.
+- You can only read it. Start, message and change threads once the machine is
+  back.
+- The machine updates the copy while it is on, at most every 15 seconds while
+  threads change and every few hours otherwise. The linked machine deletes it
+  after 7 days without an update, and a device stops showing a saved copy then.
+- The first machine to send a copy under a name owns it. If that machine loses
+  its saved key, it cannot replace the copy until it expires.
+- Only devices signed in to the original machine before it went off can open the
+  copy. A phone that has not connected to it since you turned this on needs one
+  connection first.
+- Turning this off, or choosing another machine, asks the old one to delete the
+  copy. If it cannot be reached, devices that already had access can keep
+  reading the list until the copy expires.
+
 ## Manage or revoke access
 
 On the host, **Settings → Sharing & access** lets authorized administrators create

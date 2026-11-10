@@ -6,22 +6,27 @@ import {
   type OrchestrationV2ThreadShell,
   type ServerConfig,
   type ThreadId,
+  type ThreadMirrorCopy,
   type ThreadPullRequestLink,
+  threadMirrorSupersedes,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom } from "effect/reactivity";
 
 import * as EnvironmentRegistry from "../connection/registry.ts";
-import { connectionProjectionPhase } from "../connection/model.ts";
+import { connectionProjectionPhase, type SupervisorConnectionState } from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as ConnectionWakeups from "../connection/wakeups.ts";
 import { safeErrorLogAttributes } from "../errors/safeLog.ts";
@@ -30,6 +35,7 @@ import { runCachePersistence } from "./cachePersistence.ts";
 import { subscribeDynamicWithSession } from "../rpc/client.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import * as ShellSnapshotLoader from "./shellSnapshotHttp.ts";
+import * as ThreadMirrorLoader from "./threadMirrorHttp.ts";
 import type { DeferredShellSnapshot } from "./shellPullRequests.ts";
 import {
   applyShellStreamEvents,
@@ -55,6 +61,20 @@ export interface EnvironmentShellState {
   readonly generation: number;
   /** Sequences of the thread removals applied since the latest authoritative snapshot. */
   readonly removedAt: ReadonlyMap<ThreadId, number>;
+  /**
+   * Set while the rows are another environment's copy of this one's list, because this one is
+   * unreachable. Live data replaces it; commands still go to this environment only.
+   */
+  readonly mirror: Option.Option<EnvironmentShellMirror>;
+}
+
+export interface EnvironmentShellMirror {
+  readonly hostEnvironmentId: EnvironmentId;
+  readonly sourceLabel: string;
+  /** Epoch milliseconds when the host last heard from the source. */
+  readonly syncedAt: number;
+  /** Epoch milliseconds when the host stops serving this copy; the rows are dropped then. */
+  readonly expiresAt: number;
 }
 
 const EMPTY_REMOVALS: ReadonlyMap<ThreadId, number> = new Map();
@@ -67,6 +87,7 @@ export const EMPTY_SHELL_STATE: EnvironmentShellState = {
   error: Option.none(),
   generation: 0,
   removedAt: EMPTY_REMOVALS,
+  mirror: Option.none(),
 };
 
 function shellStatusForSnapshot(
@@ -79,6 +100,24 @@ function withoutDeferredPullRequests(value: DeferredShellSnapshot): Orchestratio
   if (value.loadPullRequests === undefined) return value;
   const { loadPullRequests: _deferred, ...snapshot } = value;
   return snapshot;
+}
+
+// Exports reach the host every few hours or on change, so a slow poll loses little.
+const MIRROR_POLL_SECONDS = 45;
+const MIRROR_RETRY_MIN_SECONDS = 10;
+const MIRROR_RETRY_MAX_SECONDS = 300;
+
+/**
+ * Only a source that is wanted and failing to answer may be read from its host. A refused
+ * credential, an unsupported server, a disabled connection or a pending session is not offline.
+ */
+export function mirrorFallbackEligible(state: SupervisorConnectionState): boolean {
+  return (
+    state.desired &&
+    state.phase === "backoff" &&
+    state.lastFailure?._tag === "ConnectionTransientError" &&
+    state.lastFailure.reason !== "session-pending"
+  );
 }
 
 const SHELL_SYNCHRONIZATION_ERROR_MESSAGE = "Could not synchronize environment data.";
@@ -105,6 +144,8 @@ function canResumeFrom(
   if (origin === undefined || identity === null) return false;
   const age = now - origin.snapshotAt;
   return (
+    origin.fromMirror === undefined &&
+    origin.databaseId === identity.databaseId &&
     origin.serverVersion === identity.serverVersion &&
     origin.databaseMigration === identity.databaseMigration &&
     origin.omitIdleSubagents === identity.omitIdleSubagents &&
@@ -124,6 +165,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
   const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
   const cache = yield* Persistence.EnvironmentCacheStore;
   const snapshotLoader = yield* ShellSnapshotLoader.ShellSnapshotLoader;
+  const mirrorLoader = yield* Effect.serviceOption(ThreadMirrorLoader.ThreadMirrorLoader);
   const wakeups = yield* Effect.serviceOption(ConnectionWakeups.ConnectionWakeups);
   const environmentId = supervisor.target.environmentId;
   const cached = yield* cache.loadShell(environmentId).pipe(
@@ -137,14 +179,28 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       ),
     ),
   );
-  const cachedOrigin = Option.isSome(cached) ? cached.value.origin : undefined;
-  const cachedSnapshot = Option.map(cached, ({ origin: _origin, ...rows }) =>
-    withoutDeferredPullRequests(rows),
-  );
+  // Rows that were a host's copy are dropped once the host's lease on them has ended.
+  const loadedAt = yield* Clock.currentTimeMillis;
+  const lapsed =
+    Option.isSome(cached) &&
+    cached.value.origin?.fromMirror !== undefined &&
+    cached.value.origin.fromMirror.expiresAt <= loadedAt;
+  const cachedOrigin = Option.isSome(cached) && !lapsed ? cached.value.origin : undefined;
+  const cachedSnapshot = lapsed
+    ? Option.none<OrchestrationV2ShellSnapshot>()
+    : Option.map(cached, ({ origin: _origin, ...rows }) => withoutDeferredPullRequests(rows));
+  const restoredMirror =
+    cachedOrigin?.fromMirror === undefined || cachedOrigin.mirror === undefined
+      ? Option.none<EnvironmentShellMirror>()
+      : Option.some<EnvironmentShellMirror>({
+          hostEnvironmentId: cachedOrigin.mirror.hostEnvironmentId,
+          ...cachedOrigin.fromMirror,
+        });
   const state = yield* SubscriptionRef.make<EnvironmentShellState>({
     ...EMPTY_SHELL_STATE,
     snapshot: cachedSnapshot,
     status: shellStatusForSnapshot(cachedSnapshot),
+    mirror: restoredMirror,
   });
   const awaitingCompletion = yield* Ref.make(false);
   const activeSubscription = yield* Ref.make<ShellSubscription | null>(null);
@@ -152,6 +208,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
   // Only a server snapshot renews it; `snapshot-required` drops it.
   const origin = yield* Ref.make(cachedOrigin);
   const reloadRequests = yield* Queue.unbounded<void>();
+  const grantRefreshRequests = yield* Queue.sliding<void>(1);
   const latestLive = yield* Ref.make<Option.Option<LiveShell>>(Option.none());
   const persistence = yield* Queue.sliding<OrchestrationV2ShellSnapshot>(1);
 
@@ -291,6 +348,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
           snapshot: Option.some(applyShellStreamEvents(next.snapshot.value, deltas)),
           status: waiting ? "synchronizing" : "live",
           error: Option.none(),
+          mirror: Option.none(),
         };
       }
       deltas = [];
@@ -313,6 +371,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
             ...next,
             status: "live",
             error: Option.none(),
+            mirror: Option.none(),
             // A cache resume that caught up is as current as a snapshot for generation readers.
             generation: next.generation === 0 ? ++lastShellGeneration : next.generation,
           };
@@ -334,6 +393,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         error: Option.none(),
         generation: authoritative ? ++lastShellGeneration : next.generation,
         removedAt: authoritative ? EMPTY_REMOVALS : next.removedAt,
+        mirror: Option.none(),
       };
     }
     flushDeltas();
@@ -346,11 +406,18 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       yield* Ref.set(origin, nextOrigin);
       yield* Queue.offer(reloadRequests, undefined);
     } else if (receivedAuthoritativeSnapshot) {
+      // The key held so far stays until the source issues a new one or withdraws it.
+      const heldMirror = nextOrigin?.mirror;
       nextOrigin =
         subscription?.identity == null
           ? undefined
-          : { ...subscription.identity, snapshotAt: yield* Clock.currentTimeMillis };
+          : {
+              ...subscription.identity,
+              ...(heldMirror === undefined ? {} : { mirror: heldMirror }),
+              snapshotAt: yield* Clock.currentTimeMillis,
+            };
       yield* Ref.set(origin, nextOrigin);
+      if (nextOrigin !== undefined) yield* Queue.offer(grantRefreshRequests, undefined);
     }
     if (next === initial) return;
     if (pendingLinkIds !== undefined && Option.isSome(next.snapshot)) {
@@ -371,6 +438,162 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
   }, snapshotWriteLock.withPermit);
 
   const stateScope = yield* Effect.scope;
+  // This client's key to the source's copy on the host, taken from the source while it answers.
+  // It rides in the cache origin, so a restart with the source off can still read the copy.
+  const refreshReaderGrant = Effect.fn("EnvironmentShellState.refreshReaderGrant")(function* () {
+    if (Option.isNone(mirrorLoader)) return;
+    const issued = yield* mirrorLoader.value.readerGrant.pipe(
+      Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+    );
+    // Unreachable or unsupported: keep the key held, which the host refuses once it is stale.
+    if (Option.isNone(issued)) return;
+    const { hostEnvironmentId, grant } = issued.value;
+    yield* snapshotWriteLock.withPermit(
+      Effect.gen(function* () {
+        const held = yield* Ref.get(origin);
+        const live = yield* Ref.get(latestLive);
+        if (held === undefined || Option.isNone(live)) return;
+        const { mirror: heldMirror, ...rest } = held;
+        const mirror =
+          hostEnvironmentId === null || grant === null ? undefined : { hostEnvironmentId, grant };
+        if (
+          heldMirror?.hostEnvironmentId === mirror?.hostEnvironmentId &&
+          heldMirror?.grant === mirror?.grant
+        ) {
+          return;
+        }
+        const nextOrigin = mirror === undefined ? rest : { ...rest, mirror };
+        yield* Ref.set(origin, nextOrigin);
+        yield* Ref.set(
+          latestLive,
+          Option.some({ snapshot: live.value.snapshot, origin: nextOrigin }),
+        );
+        yield* Queue.offer(persistence, live.value.snapshot);
+      }),
+    );
+  });
+
+  // The host's copy replaces the rows only while this environment is not answering, and only
+  // when it is strictly newer in the same source database; commands never go to the host. A copy
+  // at the rows' own sequence only brings the notice and lease, since the list is the same.
+  const applyMirrorCopy = Effect.fn("EnvironmentShellState.applyMirrorCopy")(function* (
+    copy: ThreadMirrorCopy,
+  ) {
+    return yield* snapshotWriteLock.withPermit(
+      Effect.gen(function* () {
+        const current = yield* SubscriptionRef.get(state);
+        const held = yield* Ref.get(origin);
+        if (
+          (current.status !== "cached" && current.status !== "empty") ||
+          held?.mirror === undefined
+        ) {
+          return false;
+        }
+        const previous = Option.getOrNull(current.snapshot);
+        const replaces = threadMirrorSupersedes(
+          previous === null
+            ? null
+            : { databaseId: held.databaseId, sequence: previous.snapshotSequence },
+          copy,
+        );
+        const sameList =
+          previous !== null &&
+          held.databaseId === copy.sourceDatabaseId &&
+          copy.sourceSequence === previous.snapshotSequence;
+        if (!replaces && !sameList) return false;
+        const provenance = {
+          sourceLabel: copy.sourceLabel,
+          syncedAt: DateTime.toEpochMillis(copy.receivedAt),
+          expiresAt: DateTime.toEpochMillis(copy.expiresAt),
+        };
+        const nextOrigin = { ...held, fromMirror: provenance };
+        const mirror = Option.some({
+          hostEnvironmentId: held.mirror.hostEnvironmentId,
+          ...provenance,
+        });
+        const snapshot = replaces
+          ? mergeShellSnapshotProjects(
+              previous,
+              reuseUnchangedThreadShells(previous, copy.snapshot),
+            )
+          : previous;
+        if (snapshot === null) return false;
+        yield* Ref.set(origin, nextOrigin);
+        yield* Ref.set(latestLive, Option.some({ snapshot, origin: nextOrigin }));
+        yield* SubscriptionRef.set(state, {
+          ...current,
+          snapshot: Option.some(snapshot),
+          ...(replaces ? { generation: ++lastShellGeneration, removedAt: EMPTY_REMOVALS } : {}),
+          mirror,
+        });
+        yield* Queue.offer(persistence, snapshot);
+        return replaces;
+      }),
+    );
+  });
+
+  // Rows that came from the host stop being shown once the host's lease on the copy ends.
+  const dropLapsedMirror = Effect.fn("EnvironmentShellState.dropLapsedMirror")(function* () {
+    const now = yield* Clock.currentTimeMillis;
+    yield* snapshotWriteLock.withPermit(
+      Effect.gen(function* () {
+        const current = yield* SubscriptionRef.get(state);
+        if (Option.isNone(current.mirror) || current.mirror.value.expiresAt > now) return;
+        yield* Ref.set(origin, undefined);
+        yield* Ref.set(latestLive, Option.none());
+        yield* SubscriptionRef.set(state, {
+          ...current,
+          snapshot: Option.none(),
+          status: "empty",
+          mirror: Option.none(),
+        });
+      }),
+    );
+  });
+
+  // Reads the host again while the source is unreachable: soon after a failure, then slowly to
+  // pick up later exports. Ends when the source connects or is blocked, which interrupts it.
+  const mirrorFallback = Effect.gen(function* () {
+    if (Option.isNone(mirrorLoader)) return;
+    for (let failures = 0; ;) {
+      const held = yield* Ref.get(origin);
+      const copy =
+        held?.mirror === undefined
+          ? Option.none<ThreadMirrorCopy>()
+          : yield* mirrorLoader.value.loadCopy({
+              hostEnvironmentId: held.mirror.hostEnvironmentId,
+              sourceEnvironmentId: environmentId,
+              grant: held.mirror.grant,
+            });
+      if (Option.isSome(copy)) {
+        failures = 0;
+        yield* applyMirrorCopy(copy.value);
+      } else {
+        failures += 1;
+      }
+      yield* dropLapsedMirror();
+      yield* Effect.sleep(
+        Duration.seconds(
+          failures === 0
+            ? MIRROR_POLL_SECONDS
+            : Math.min(MIRROR_RETRY_MAX_SECONDS, MIRROR_RETRY_MIN_SECONDS * 2 ** (failures - 1)),
+        ),
+      );
+    }
+  });
+  let activeMirrorFallback: Fiber.Fiber<void> | undefined;
+  const setMirrorFallback = (running: boolean) =>
+    Effect.suspend(() => {
+      const fiber = activeMirrorFallback;
+      if (running === (fiber !== undefined)) return Effect.void;
+      activeMirrorFallback = undefined;
+      if (fiber !== undefined) return Fiber.interrupt(fiber);
+      return Effect.forkIn(mirrorFallback, stateScope).pipe(
+        Effect.tap((forked) => Effect.sync(() => void (activeMirrorFallback = forked))),
+        Effect.asVoid,
+      );
+    });
+
   // Each full snapshot supersedes the previous one's fill; links from an older snapshot must
   // not land on rows a newer snapshot reused.
 
@@ -446,6 +669,10 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     }),
   );
 
+  yield* Stream.fromQueue(grantRefreshRequests).pipe(
+    Stream.runForEach(() => refreshReaderGrant()),
+    Effect.forkScoped,
+  );
   yield* setSynchronizing;
   yield* Effect.forkScoped(
     subscribeDynamicWithSession(
@@ -458,6 +685,9 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
               serverVersion: config.environment.serverVersion,
               // Migrations rewrite projections without events, so a migrated server reloads.
               databaseMigration: config.environment.databaseMigration ?? null,
+              ...(config.environment.databaseId === undefined
+                ? {}
+                : { databaseId: config.environment.databaseId }),
               omitIdleSubagents,
               omitOlderSettled: config.shellOlderSettled === true && omitIdleSubagents,
             };
@@ -468,6 +698,22 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
           omitIdleSubagents: false,
           omitOlderSettled: false,
         };
+        // The source's own host choice changes without any thread changing, and the key held
+        // would name the old host (or none), so a change asks it for a fresh one.
+        yield* session.subscribeServerConfig().pipe(
+          Stream.filterMap((event) =>
+            event.type === "snapshot"
+              ? Result.succeed(event.config.settings.threadMirrorHostEnvironmentId)
+              : event.type === "settingsUpdated"
+                ? Result.succeed(event.payload.settings.threadMirrorHostEnvironmentId)
+                : Result.failVoid,
+          ),
+          Stream.changes,
+          Stream.runForEach(() => Queue.offer(grantRefreshRequests, undefined)),
+          Effect.raceFirst(session.closed),
+          Effect.ignore,
+          Effect.forkIn(stateScope),
+        );
         yield* Ref.set(activeSubscription, { session, identity });
         yield* Ref.set(awaitingCompletion, true);
         yield* setSynchronizing;
@@ -548,11 +794,13 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     Stream.runForEach((connectionState) => {
       switch (connectionProjectionPhase(connectionState)) {
         case "synchronizing":
-          return setSynchronizing;
+          return setMirrorFallback(false).pipe(Effect.andThen(setSynchronizing));
         case "disconnected":
-          return setDisconnected;
+          return setDisconnected.pipe(
+            Effect.andThen(setMirrorFallback(mirrorFallbackEligible(connectionState))),
+          );
         case "ready":
-          return setReady;
+          return setMirrorFallback(false).pipe(Effect.andThen(setReady));
       }
     }),
     Effect.forkScoped,
@@ -640,6 +888,44 @@ export function createEnvironmentShellSummaryAtom(input: {
   }).pipe(Atom.withLabel("environment-shell-summary"));
 }
 
+export interface EnvironmentMirrorSummaryEntry {
+  readonly environmentId: EnvironmentId;
+  readonly sourceLabel: string;
+  readonly syncedAt: number;
+}
+
+const EMPTY_MIRROR_SUMMARY: ReadonlyArray<EnvironmentMirrorSummaryEntry> = Object.freeze([]);
+
+/** Environments whose threads are a saved copy; shell pushes leave it untouched until one changes. */
+export function createEnvironmentMirrorSummaryAtom(input: {
+  readonly catalogValueAtom: Atom.Atom<EnvironmentCatalogState>;
+  readonly shellStateValueAtom: (environmentId: EnvironmentId) => Atom.Atom<EnvironmentShellState>;
+}) {
+  let previous = EMPTY_MIRROR_SUMMARY;
+  return Atom.make((get) => {
+    const next: Array<EnvironmentMirrorSummaryEntry> = [];
+    for (const environmentId of enabledEnvironmentIds(get(input.catalogValueAtom))) {
+      const mirror = Option.getOrNull(get(input.shellStateValueAtom(environmentId)).mirror);
+      if (mirror !== null) {
+        next.push({ environmentId, sourceLabel: mirror.sourceLabel, syncedAt: mirror.syncedAt });
+      }
+    }
+    if (
+      next.length === previous.length &&
+      next.every(
+        (entry, index) =>
+          entry.environmentId === previous[index]?.environmentId &&
+          entry.sourceLabel === previous[index]?.sourceLabel &&
+          entry.syncedAt === previous[index]?.syncedAt,
+      )
+    ) {
+      return previous;
+    }
+    previous = next.length === 0 ? EMPTY_MIRROR_SUMMARY : next;
+    return previous;
+  }).pipe(Atom.withLabel("environment-mirror-summary"));
+}
+
 export function createEnvironmentServerConfigsAtom(input: {
   readonly catalogValueAtom: Atom.Atom<EnvironmentCatalogState>;
   readonly serverConfigValueAtom: (environmentId: EnvironmentId) => Atom.Atom<ServerConfig | null>;
@@ -718,4 +1004,5 @@ export * from "./shellCommands.ts";
 export * from "./shellReducer.ts";
 export * from "./shellPullRequests.ts";
 export * as ShellSnapshotLoader from "./shellSnapshotHttp.ts";
+export * as ThreadMirrorLoader from "./threadMirrorHttp.ts";
 export * from "./snapshots.ts";

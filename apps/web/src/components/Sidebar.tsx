@@ -153,6 +153,7 @@ import {
   useServerConfigs,
   useQuietThreadShells,
 } from "../state/entities";
+import { MirroredEnvironmentsNotice } from "./sidebar/MirroredEnvironmentsNotice";
 import { environmentPresentations } from "../state/presentation";
 import { primaryServerKeybindingsAtom } from "../state/server";
 import { environmentProjects } from "../state/projects";
@@ -3230,6 +3231,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         }
       >
         <SidebarGroup className="flex-1" role="presentation">
+          <MirroredEnvironmentsNotice />
           {isSearchingThreads ? (
             threadSearchResults.length > 0 ? (
               <TooltipProvider

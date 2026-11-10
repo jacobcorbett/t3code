@@ -47,3 +47,25 @@ export function databaseMigrationHead(databasePath: string): number | undefined 
     ? undefined
     : Math.max(BUILD_MIGRATION_HEAD, ...recorded.map(({ id }) => id));
 }
+
+/** The id the database names itself with, read-only. Undefined until migrations have created it. */
+export function recordedDatabaseId(databasePath: string): string | undefined {
+  let db: NodeSqlite.DatabaseSync;
+  try {
+    db = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
+  } catch {
+    return undefined;
+  }
+  try {
+    const row = db.prepare("SELECT database_id FROM server_database_identity").get();
+    return typeof row?.database_id === "string" ? row.database_id : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // A read-only handle has nothing to flush; the result above already stands.
+    }
+  }
+}

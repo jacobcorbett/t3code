@@ -44,6 +44,7 @@ import {
 } from "./environment.ts";
 import {
   DpopFailureReason,
+  EnvironmentId,
   AuthSessionId,
   ThreadId,
   TrimmedNonEmptyString,
@@ -65,6 +66,15 @@ import {
   EnvironmentSpeechTranscriptionResult,
 } from "./speech.ts";
 import { SecretReference } from "./secretReference.ts";
+import {
+  THREAD_MIRROR_GRANT_HEADER,
+  THREAD_MIRROR_WRITER_HEADER,
+  ThreadMirrorAck,
+  ThreadMirrorCopy,
+  ThreadMirrorExport,
+  ThreadMirrorReaderGrant,
+  ThreadMirrorRemoveResult,
+} from "./threadMirror.ts";
 import {
   OrchestrationV2ShellSnapshot,
   OrchestrationV2ThreadBoundedSnapshot,
@@ -113,6 +123,8 @@ export const EnvironmentRequestInvalidReason = Schema.Literals([
   "invalid_audio",
   "speech_unavailable",
   "speech_busy",
+  "thread_mirror_too_large",
+  "thread_mirror_expired",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
 
@@ -128,6 +140,7 @@ export const EnvironmentOperationForbiddenReason = Schema.Literals([
 export type EnvironmentOperationForbiddenReason = typeof EnvironmentOperationForbiddenReason.Type;
 
 export const EnvironmentInternalErrorReason = Schema.Literals([
+  "thread_mirror_failed",
   "bootstrap_validation_failed",
   "browser_session_issuance_failed",
   "browser_session_cookie_failed",
@@ -240,7 +253,10 @@ export class EnvironmentInternalError extends Schema.TaggedError<EnvironmentInte
   }
 }
 
-export const EnvironmentResourceNotFoundReason = Schema.Literals(["thread_not_found"]);
+export const EnvironmentResourceNotFoundReason = Schema.Literals([
+  "thread_not_found",
+  "thread_mirror_not_found",
+]);
 export type EnvironmentResourceNotFoundReason = typeof EnvironmentResourceNotFoundReason.Type;
 
 export class EnvironmentResourceNotFoundError extends Schema.TaggedError<EnvironmentResourceNotFoundError>()(
@@ -406,6 +422,19 @@ export class EnvironmentAuthenticatedPrincipal extends Context.Service<
   EnvironmentAuthenticatedPrincipal,
   EnvironmentSessionPrincipalShape
 >()("@t3tools/contracts/environmentHttp/EnvironmentAuthenticatedPrincipal") {}
+
+/** A linked environment signed in to this one by pairing code; only thread list copies accept it over HTTP. */
+export class EnvironmentPeerLinkPrincipal extends Context.Service<
+  EnvironmentPeerLinkPrincipal,
+  { readonly sessionId: AuthSessionId }
+>()("@t3tools/contracts/environmentHttp/EnvironmentPeerLinkPrincipal") {}
+
+export class EnvironmentPeerLinkAuth extends HttpApiMiddleware.Service<
+  EnvironmentPeerLinkAuth,
+  { provides: EnvironmentPeerLinkPrincipal }
+>()("EnvironmentPeerLinkAuth", {
+  error: EnvironmentAuthenticationErrors,
+}) {}
 
 export class EnvironmentAuthenticatedAuth extends HttpApiMiddleware.Service<
   EnvironmentAuthenticatedAuth,
@@ -752,6 +781,56 @@ class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
     }).middleware(EnvironmentAuthenticatedAuth),
   ) {}
 
+const ThreadMirrorParams = Schema.Struct({ sourceEnvironmentId: EnvironmentId });
+const ThreadMirrorReadHeaders = Schema.Struct({
+  ...OrchestrationProtocolHeaders.fields,
+  [THREAD_MIRROR_GRANT_HEADER]: Schema.String,
+});
+const ThreadMirrorWriteHeaders = Schema.Struct({
+  ...OrchestrationProtocolHeaders.fields,
+  [THREAD_MIRROR_WRITER_HEADER]: Schema.String.check(Schema.isMinLength(32)),
+});
+const EnvironmentThreadMirrorErrors = [
+  EnvironmentRequestInvalidError,
+  EnvironmentScopeRequiredError,
+  EnvironmentResourceNotFoundError,
+  EnvironmentInternalError,
+] as const;
+
+class EnvironmentThreadMirrorHttpApi extends HttpApiGroup.make("threadMirror")
+  .add(
+    HttpApiEndpoint.get("readerGrant", "/api/thread-mirror-grant", {
+      headers: OrchestrationProtocolHeaders,
+      success: ThreadMirrorReaderGrant,
+      error: EnvironmentOrchestrationSnapshotErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.put("put", "/api/thread-mirror/:sourceEnvironmentId", {
+      headers: ThreadMirrorWriteHeaders,
+      params: ThreadMirrorParams,
+      payload: ThreadMirrorExport,
+      success: ThreadMirrorAck,
+      error: EnvironmentThreadMirrorErrors,
+    }).middleware(EnvironmentPeerLinkAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("get", "/api/thread-mirror/:sourceEnvironmentId", {
+      headers: ThreadMirrorReadHeaders,
+      params: ThreadMirrorParams,
+      success: ThreadMirrorCopy,
+      error: EnvironmentThreadMirrorErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.delete("delete", "/api/thread-mirror/:sourceEnvironmentId", {
+      headers: ThreadMirrorWriteHeaders,
+      params: ThreadMirrorParams,
+      success: ThreadMirrorRemoveResult,
+      error: EnvironmentThreadMirrorErrors,
+    }).middleware(EnvironmentPeerLinkAuth),
+  ) {}
+
 class EnvironmentProjectsHttpApi extends HttpApiGroup.make("projects")
   .add(
     HttpApiEndpoint.get("snapshot", "/api/projects", {
@@ -1009,6 +1088,7 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentAuthHttpApi)
   .add(EnvironmentMcpOAuthHttpApi)
   .add(EnvironmentOrchestrationHttpApi)
+  .add(EnvironmentThreadMirrorHttpApi)
   .add(EnvironmentPullRequestsHttpApi)
   .add(EnvironmentProjectsHttpApi)
   .add(EnvironmentVoiceHttpApi)

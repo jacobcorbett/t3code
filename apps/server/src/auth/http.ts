@@ -17,11 +17,15 @@ import {
   EnvironmentScopeRequiredError,
   EnvironmentAuthenticatedAuth,
   EnvironmentAuthenticatedPrincipal,
+  EnvironmentPeerLinkAuth,
+  EnvironmentPeerLinkPrincipal,
   mcpClientScopes,
+  THREAD_MIRROR_MAX_BODY_BYTES,
 } from "@t3tools/contracts";
 import type { AuthEnvironmentScope, DpopFailureReason } from "@t3tools/contracts";
 import { parseOAuthScope } from "@t3tools/shared/oauthScope";
 import { causeErrorTag } from "@t3tools/shared/observability";
+import * as ByteSize from "effect/ByteSize";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -29,6 +33,7 @@ import * as Schema from "effect/Schema";
 import * as Layer from "effect/Layer";
 import * as Cookies from "effect/http/Cookies";
 import * as HttpEffect from "effect/http/HttpEffect";
+import * as HttpIncomingMessage from "effect/http/HttpIncomingMessage";
 import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 
@@ -257,6 +262,43 @@ export const layerAuthenticatedAuth = Layer.effect(
           ? traceAuthenticatedRelayRequest(handler, { startTime, endTime })
           : handler;
       }).pipe(Effect.catchTags({ EnvironmentAuthInvalidError: appendDpopChallengeOnUnauthorized }));
+  }),
+);
+
+export const layerPeerLinkAuth = Layer.effect(
+  EnvironmentPeerLinkAuth,
+  Effect.gen(function* () {
+    const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+    return (httpEffect) =>
+      Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const session = yield* serverAuth.authenticateMcpClient(request).pipe(
+          Effect.filterOrFail(
+            (client) => client.peerLink,
+            () =>
+              new EnvironmentAuth.ServerAuthInvalidCredentialError({
+                diagnostic: "Only a linked environment may use this endpoint.",
+              }),
+          ),
+          Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, (error) =>
+            failEnvironmentAuthInvalid(
+              EnvironmentAuth.serverAuthCredentialReason(error),
+              EnvironmentAuth.serverAuthDpopFailureReason(error),
+            ),
+          ),
+          Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+            failEnvironmentInternal("internal_error", error),
+          ),
+        );
+        return yield* httpEffect.pipe(
+          Effect.provideService(EnvironmentPeerLinkPrincipal, { sessionId: session.sessionId }),
+          // The export is read whole, so the reader is capped for chunked bodies too.
+          Effect.provideService(
+            HttpIncomingMessage.MaxBodySize,
+            ByteSize.bytes(THREAD_MIRROR_MAX_BODY_BYTES),
+          ),
+        );
+      });
   }),
 );
 
